@@ -17,6 +17,7 @@
 
 import base64
 import io
+import pickle
 import tempfile
 
 import ddsp
@@ -26,6 +27,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pydub import AudioSegment
 from scipy.io import wavfile
+from sklearn import preprocessing
 import tensorflow.compat.v2 as tf
 
 from google.colab import files
@@ -37,6 +39,9 @@ DEFAULT_SAMPLE_RATE = 16000
 _play_count = 0  # Used for ephemeral play().
 
 
+# ------------------------------------------------------------------------------
+# IO
+# ------------------------------------------------------------------------------
 def play(array_of_floats,
          sample_rate=DEFAULT_SAMPLE_RATE,
          ephemeral=True,
@@ -182,6 +187,9 @@ def upload(sample_rate=DEFAULT_SAMPLE_RATE, normalize_db=None):
   return fnames, audio
 
 
+# ------------------------------------------------------------------------------
+# Plotting
+# ------------------------------------------------------------------------------
 def specplot(audio,
              vmin=-5,
              vmax=1,
@@ -239,3 +247,169 @@ def plot_impulse_responses(impulse_response,
   plt.subplot(122)
   plt.plot(impulse_response[0, 0, :])
   plt.title('Impulse Response')
+
+
+# ------------------------------------------------------------------------------
+# Loudness Normalization
+# ------------------------------------------------------------------------------
+def smooth(x, filter_size=3):
+  """Smooth 1-d signal with a box filter."""
+  x = tf.convert_to_tensor(x, tf.float32)
+  is_2d = len(x.shape) == 2
+  x = x[:, :, tf.newaxis] if is_2d else x[tf.newaxis, :, tf.newaxis]
+  w = tf.ones([filter_size])[:, tf.newaxis, tf.newaxis] / float(filter_size)
+  y = tf.nn.conv1d(x, w, stride=1, padding='SAME')
+  y = y[:, :, 0] if is_2d else y[0, :, 0]
+  return y.numpy()
+
+
+def detect_notes(loudness_db,
+                 f0_confidence,
+                 note_threshold=1.0,
+                 exponent=2.0,
+                 smoothing=40,
+                 f0_confidence_threshold=0.7,
+                 min_db=-120.):
+  """Detect note on-off using loudness and smoothed f0_confidence."""
+  mean_db = np.mean(loudness_db)
+  db = smooth(f0_confidence**exponent, smoothing) * (loudness_db - min_db)
+  db_threshold = (mean_db - min_db) * f0_confidence_threshold**exponent
+  note_on_value = db / db_threshold
+  mask_on = note_on_value >= note_threshold
+  return mask_on, note_on_value
+
+
+def fit_quantile_transform(loudness_db,
+                           mask_on,
+                           inv_quantile=None):
+  """Fits quantile normalization, given a note_on mask.
+
+  Optionally, performs the inverse transformation given a pre-fitted transform.
+  Args:
+    loudness_db: Decibels, shape [batch, time]
+    mask_on: A binary mask for when a note is present, shape [batch, time].
+    inv_quantile: Optional pretrained QuantileTransformer to perform the
+      inverse transformation.
+
+  Returns:
+    Trained quantile transform. Also returns the renormalized loudnesses if
+      inv_quantile is provided.
+  """
+  quantile_transform = preprocessing.QuantileTransformer()
+  loudness_flat = np.ravel(loudness_db[mask_on])[:, np.newaxis]
+  loudness_flat_q = quantile_transform.fit_transform(loudness_flat)
+
+  if inv_quantile is None:
+    return quantile_transform
+  else:
+    loudness_flat_norm = inv_quantile.inverse_transform(loudness_flat_q)
+    loudness_norm = np.ravel(loudness_db.copy())[:, np.newaxis]
+    loudness_norm[mask_on] = loudness_flat_norm
+    return quantile_transform, loudness_norm
+
+
+def save_dataset_statistics(data_provider, file_path, batch_size=128):
+  """Calculate dataset stats and save in a pickle file."""
+  print('Calculating dataset statistics for', data_provider)
+  data_iter = iter(data_provider.get_batch(batch_size, repeats=1))
+
+  # Unpack dataset.
+  i = 0
+  loudness = []
+  f0 = []
+  f0_conf = []
+  audio = []
+
+  for batch in data_iter:
+    loudness.append(batch['loudness_db'])
+    f0.append(batch['f0_hz'])
+    f0_conf.append(batch['f0_confidence'])
+    audio.append(batch['audio'])
+    i += 1
+    print('batch: {}'.format(i))
+
+  loudness = np.vstack(loudness)
+  f0 = np.vstack(f0)
+  f0_conf = np.vstack(f0_conf)
+  audio = np.vstack(audio)
+
+  # Fit the transform.
+  trim_end = 20
+  f0_trimmed = f0[:, :-trim_end]
+  l_trimmed = loudness[:, :-trim_end]
+  f0_conf_trimmed = f0_conf[:, :-trim_end]
+  mask_on, _ = detect_notes(l_trimmed, f0_conf_trimmed)
+  quantile_transform = fit_quantile_transform(l_trimmed, mask_on)
+
+  # Average pitch.
+  mean_pitch = np.mean(ddsp.core.hz_to_midi(f0_trimmed[mask_on]))
+
+  # Object to pickle all the statistics together.
+  ds = {'mean_pitch': mean_pitch, 'quantile_transform': quantile_transform}
+
+  # Save.
+  with tf.io.gfile.GFile(file_path, 'wb') as f:
+    pickle.dump(ds, f)
+  print(f'Done! Saved to: {file_path}')
+
+
+# ------------------------------------------------------------------------------
+# Frequency tuning
+# ------------------------------------------------------------------------------
+def get_tuning_factor(f0_midi, f0_confidence, mask_on):
+  """Get an offset in MIDI, to most consistent set of chromatic intervals."""
+  # Difference from midi offset by different tuning_factors.
+  tuning_factors = np.linspace(-0.5, 0.5, 101)  # 1 cent divisions.
+  midi_diffs = (f0_midi[mask_on][:, np.newaxis] -
+                tuning_factors[np.newaxis, :]) % 1.0
+  midi_diffs[midi_diffs > 0.5] -= 1.0
+  weights = f0_confidence[mask_on][:, np.newaxis]
+
+  ## Computes mininmum adjustment distance.
+  cost_diffs = np.abs(midi_diffs)
+  cost_diffs = np.mean(weights * cost_diffs, axis=0)
+
+  ## Computes mininmum "note" transistions.
+  f0_at = f0_midi[mask_on][:, np.newaxis] - midi_diffs
+  f0_at_diffs = np.diff(f0_at, axis=0)
+  deltas = (f0_at_diffs != 0.0).astype(np.float)
+  cost_deltas = np.mean(weights[:-1] * deltas, axis=0)
+
+  # Tuning factor is minimum cost.
+  norm = lambda x: (x - np.mean(x)) / np.std(x)
+  cost = norm(cost_deltas) + norm(cost_diffs)
+  return tuning_factors[np.argmin(cost)]
+
+
+def auto_tune(f0_midi, tuning_factor, mask_on, amount=0.0, chromatic=False):
+  """Reduce variance of f0 from the chromatic or scale intervals."""
+  if chromatic:
+    midi_diff = (f0_midi - tuning_factor) % 1.0
+    midi_diff[midi_diff > 0.5] -= 1.0
+  else:
+    major_scale = np.ravel([
+        np.array([0, 2, 4, 5, 7, 9, 11]) + 12 * i for i in range(10)])
+    all_scales = np.stack([major_scale + i for i in range(12)])
+
+    f0_on = f0_midi[mask_on]
+    # [time, scale, note]
+    f0_diff_tsn = (f0_on[:, np.newaxis, np.newaxis] -
+                   all_scales[np.newaxis, :, :])
+    # [time, scale]
+    f0_diff_ts = np.min(np.abs(f0_diff_tsn), axis=-1)
+    # [scale]
+    f0_diff_s = np.mean(f0_diff_ts, axis=0)
+    scale_idx = np.argmin(f0_diff_s)
+    scale = ['C', 'Db', 'D', 'Eb', 'F', 'Gb',
+             'G', 'Ab', 'A', 'Bb', 'B', 'C'][scale_idx]
+
+    # [time]
+    f0_diff_tn = f0_midi[:, np.newaxis] - all_scales[scale_idx][np.newaxis, :]
+    note_idx = np.argmin(np.abs(f0_diff_tn), axis=-1)
+    midi_diff = np.take_along_axis(f0_diff_tn,
+                                   note_idx[:, np.newaxis], axis=-1)[:, 0]
+    print('Autotuning... \nInferred key: {}  '
+          '\nTuning offset: {} cents'.format(scale, int(tuning_factor*100)))
+
+  # Adjust the midi signal.
+  return f0_midi - amount * midi_diff

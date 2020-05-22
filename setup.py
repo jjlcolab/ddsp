@@ -46,6 +46,8 @@ setuptools.setup(
         'pydub',
         'numpy',
         'scipy',
+        # TODO(jesseengel): Keep in sync with internal version. Update pickles.
+        'scikit-learn==0.21.3',
         'six',
         'tensorflow',
         # TODO(adarob): Switch to tensorflow_datasets once includes nsynth 2.3.
